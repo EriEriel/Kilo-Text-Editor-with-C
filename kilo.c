@@ -11,13 +11,24 @@
 
 /*** defines ***/
 
+#define KILO_VERSION "0.0.1"
+
 //Set upper 3 bits of character(1 byte) to 0. mimic Ctrl press
 #define CTRL_KEY(k) ((k) & 0x1f)
+
+enum editorKey {
+  //set int to 1000 because this out of range of any character, prevent conflict
+  ARROW_LEFT  = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN
+};
 
 /*** data ***/
 
 //store editor state in E
 struct editorConfig {
+  int cx, cy; //cursor position
   int screenrows;
   int screencols;
   struct termios orig_termios;
@@ -63,13 +74,32 @@ void enableRawMode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 //return keypress
-char editorReadkey(void) {
+ int editorReadKey(void) {
   int nread;
   char c;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
     if (nread == -1 && errno != EAGAIN) die("read");
   }
+
+  if (c == '\x1b') {
+    char seq[3];
+
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+    if (seq[0] == '[') {
+      switch (seq[1]) {
+        case 'A': return ARROW_UP;
+        case 'B': return ARROW_DOWN;
+        case 'C': return ARROW_RIGHT;
+        case 'D': return ARROW_LEFT;
+      }
+    }
+
+    return '\x1b';
+  } else {
   return c;
+  }
 }
 
 //Ancient Unix terminal magic!! this getCursorPosition and store in pointer (*rows and *cols)
@@ -110,7 +140,8 @@ int getWindowSize(int *rows, int *cols) {
 }
 
 /*** append buffer ***/
-
+//previously,we redraw the line with many small write() but now we want to write() only once so first we built buffer
+//create dynamic string
 struct abuf {
   char *b;
   int len;
@@ -118,54 +149,109 @@ struct abuf {
 
 #define ABUF_INIT {NULL, 0}
 
+// append s to abuf and then use realloc() to re-allocate memory to hold new string
 void abAppend(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->b, ab->len + len);
 
   if (new == NULL) return;
+  //copy the string s ,and update the pointer and length to abuf new values
   memcpy(&new[ab->len], s, len);
   ab->b = new;
   ab->len += len;
 }
-
+// deallocates the dynamic memory used by an abuf
 void abFree(struct abuf *ab) {
   free(ab->b);
 }
 
 /*** output ***/
 // draw ~ in the begining of the line by the size of window
-void editorDrawRows(void) {
-  int y; 
+void editorDrawRows(struct abuf *ab) {
+  int y;
   for (y = 0; y < E.screenrows; y++) {
-    write(STDOUT_FILENO, "~", 1);
+    //welcome message third way down of the scrren 
+    if (y == E.screenrows / 3) {
+      char welcome[80];
+      int welcomelen = snprintf(welcome, sizeof(welcome), 
+        "Kilo editor -- version %s", KILO_VERSION);
+      if (welcomelen > E.screencols) welcomelen = E.screencols;
+      //print welcome message at center except for ~ at start of the line
+      int padding = (E.screencols - welcomelen) / 2;
+      if (padding) {
+        abAppend(ab, "~", 1);
+        padding--;
+      }
+      while (padding--) abAppend(ab, " ", 1);
+      abAppend(ab, welcome, welcomelen);
+    } else {
+    abAppend(ab, "~", 1);
     // draw ~ at last line
+    }
+    //only clear one line at a time as it redrew them
+    //K command(Erase in Line) O is defualt argument
+    abAppend(ab, "\x1b[K", 3);
     if (y < E.screenrows - 1) {
-      write(STDOUT_FILENO, "/r/n", 2);
+      abAppend(ab, "\r\n", 2);
     }
   }
 }
 
 void editorRefreshScreen(void) {
-  // \x1b or 27 in decimal is a escape character. [ is combine so this is J command mostly form VT100 escape sequences
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  // 3 and 4 is bytes, this is H command to position the cursor to top-left corner.
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  //initialize new abuf called ab
+  struct abuf ab = ABUF_INIT;
+  //append every thing to buffer
+  //also hide cursor when repainting, prevent potential flickering problem
+  abAppend(&ab, "\x1b[?25l", 6);
+  abAppend(&ab, "\x1b[H", 3);
 
-  editorDrawRows();
+  editorDrawRows(&ab);
+  
+  char buf[32];
+  //set cursor position
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  abAppend(&ab, buf, strlen(buf));
 
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  abAppend(&ab, "\x1b[?25h", 6);
+  //write only once
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
 }
 
 
 /*** input ***/
+//cursor movement
+void editorMoveCursor(int key) {
+  switch (key)  {
+    case ARROW_LEFT:
+      E.cx--;
+      break;
+    case ARROW_RIGHT:
+      E.cx++;
+      break;
+    case ARROW_UP:
+      E.cy--;
+      break;
+    case ARROW_DOWN:
+      E.cy++;
+      break;
+  }
+}
 
 void editorProcessKeypress(void) {
-  char c = editorReadkey();
-
+  int c = editorReadKey();
+  //Ctrl-Q to exist
   switch (c) {
     case CTRL_KEY('q'):
       write(STDOUT_FILENO, "\x1b[2J", 4);
       write(STDOUT_FILENO, "\x1b[H", 3);
       exit(0);
+      break;
+  //cursor movement
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+      editorMoveCursor(c);
       break;
   }
 }
@@ -173,6 +259,9 @@ void editorProcessKeypress(void) {
 /*** init ***/
 
 void initEditor(void) {
+  // initialize cursor position at 0,0 (top-left corner)
+  E.cx = 0;
+  E.cy = 0;
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
@@ -187,4 +276,4 @@ int main(void) {
   return 0;
 }
 
-//currently on step 37 . working on process
+//currently on step 48. working on process

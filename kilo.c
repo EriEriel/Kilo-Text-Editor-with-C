@@ -1,11 +1,16 @@
 /*** includes ***/
 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -21,16 +26,29 @@ enum editorKey {
   ARROW_LEFT  = 1000,
   ARROW_RIGHT,
   ARROW_UP,
-  ARROW_DOWN
+  ARROW_DOWN,
+  DEL_KEY,
+  HOME_KEY,
+  END_KEY,
+  PAGE_UP,
+  PAGE_DOWN
 };
 
 /*** data ***/
 
+//erow stands for "editor row", it store line of text as pointer to dynamically re-allocate character abd data length
+typedef struct erow {
+  int size;
+  char *chars;
+} erow;
 //store editor state in E
 struct editorConfig {
   int cx, cy; //cursor position
+  int rowoff; //row offset
   int screenrows;
   int screencols;
+  int numrows;
+  erow *row;
   struct termios orig_termios;
 };
 
@@ -73,7 +91,7 @@ void enableRawMode(void) {
   //TCSAFLUSH discard any unread input before applying the change to the terminal
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
-//return keypress
+//return key-press
  int editorReadKey(void) {
   int nread;
   char c;
@@ -83,16 +101,39 @@ void enableRawMode(void) {
 
   if (c == '\x1b') {
     char seq[3];
-
+    //Esc sequences key-press
     if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
     if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
     if (seq[0] == '[') {
+      if (seq[1] >= '0' && seq[1] <= '9') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+        if (seq[2] == '~') {
+          switch (seq[1]) {
+            //due to HOME_KEY and END_KEY can have different ESC sequences depend on system so we handle of the case here
+            case '1': return HOME_KEY;
+            case '3': return DEL_KEY;
+            case '4': return END_KEY;
+            case '5': return PAGE_UP;
+            case '6': return PAGE_DOWN;
+            case '7': return HOME_KEY;
+            case '8': return END_KEY;
+          }
+        }
+      } else {
       switch (seq[1]) {
         case 'A': return ARROW_UP;
         case 'B': return ARROW_DOWN;
         case 'C': return ARROW_RIGHT;
         case 'D': return ARROW_LEFT;
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
+      }
+    }
+  } else if (seq[0] == '0') {
+      switch (seq[1]) {
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
       }
     }
 
@@ -139,6 +180,40 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
+/*** row operation ***/
+//append the row and allocate space for the new row
+void editorAppendRow(char *s, size_t len) {
+  E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+  int at = E.numrows;
+  E.row[at].size = len;
+  E.row[at].chars = malloc(len + 1);
+  memcpy(E.row[at].chars, s, len);
+  E.row[at].chars[len] = '\0';
+  E.numrows++;
+}
+
+/*** file I/O ***/
+//take file name and open the file, if blank open blank file
+void editorOpen(char *filename) {
+  FILE *fp = fopen(filename, "r");
+  if (!fp) die("fopen");
+
+
+  char *line = NULL;
+  size_t linecap = 0;
+  ssize_t linelen;
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    //strip off newline carriage becuase erow = one line of text so no use for storing newline character
+    while (linelen > 0 && (line[linelen - 1] == '\n' || 
+                           line[linelen - 1] == '\r'))
+      linelen--;
+    editorAppendRow(line, linelen);
+  } 
+  free(line);
+  fclose(fp);
+}
+
 /*** append buffer ***/
 //previously,we redraw the line with many small write() but now we want to write() only once so first we built buffer
 //create dynamic string
@@ -165,27 +240,45 @@ void abFree(struct abuf *ab) {
 }
 
 /*** output ***/
+
+//set value of E.rowoff by check if cursor moved outside of visible window
+void editorScroll(void) {
+  if (E.cy < E.rowoff) {
+    E.rowoff = E.cy;
+  }
+  if (E.cy >= E.rowoff + E.screenrows) {
+    E.rowoff = E.cy - E.screenrows + 1;
+  }
+}
+
 // draw ~ in the begining of the line by the size of window
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
-    //welcome message third way down of the scrren 
-    if (y == E.screenrows / 3) {
-      char welcome[80];
-      int welcomelen = snprintf(welcome, sizeof(welcome), 
-        "Kilo editor -- version %s", KILO_VERSION);
-      if (welcomelen > E.screencols) welcomelen = E.screencols;
-      //print welcome message at center except for ~ at start of the line
-      int padding = (E.screencols - welcomelen) / 2;
-      if (padding) {
-        abAppend(ab, "~", 1);
-        padding--;
+    int filerow = y + E.rowoff;
+    if (filerow >= E.numrows) {
+      //if text buffer is empty display welcome message third way down of the scrren
+      if (E.numrows == 0 && y == E.screenrows / 3) {
+        char welcome[80];
+        int welcomelen = snprintf(welcome, sizeof(welcome), 
+          "Kilo editor (Mod. by Eri_Eriel) -- version %s", KILO_VERSION);
+        if (welcomelen > E.screencols) welcomelen = E.screencols;
+        //print welcome message at center except for ~ at start of the line
+        int padding = (E.screencols - welcomelen) / 2;
+        if (padding) {
+          abAppend(ab, "~", 1);
+          padding--;
+        }
+        while (padding--) abAppend(ab, " ", 1);
+        abAppend(ab, welcome, welcomelen);
+      } else {
+      abAppend(ab, "~", 1);
+      // draw ~ at last line
       }
-      while (padding--) abAppend(ab, " ", 1);
-      abAppend(ab, welcome, welcomelen);
     } else {
-    abAppend(ab, "~", 1);
-    // draw ~ at last line
+      int len = E.row[filerow].size;
+      if (len > E.screencols) len = E.screencols;
+      abAppend(ab, E.row[filerow].chars, len);
     }
     //only clear one line at a time as it redrew them
     //K command(Erase in Line) O is defualt argument
@@ -197,6 +290,7 @@ void editorDrawRows(struct abuf *ab) {
 }
 
 void editorRefreshScreen(void) {
+  editorScroll();
   //initialize new abuf called ab
   struct abuf ab = ABUF_INIT;
   //append every thing to buffer
@@ -208,7 +302,7 @@ void editorRefreshScreen(void) {
   
   char buf[32];
   //set cursor position
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -219,20 +313,28 @@ void editorRefreshScreen(void) {
 
 
 /*** input ***/
-//cursor movement
+//cursor movement + out of bound prevention
 void editorMoveCursor(int key) {
   switch (key)  {
     case ARROW_LEFT:
-      E.cx--;
+      if (E.cx != 0) {
+        E.cx--;
+      }
       break;
     case ARROW_RIGHT:
-      E.cx++;
+      if (E.cx != E.screencols - 1) {
+        E.cx++;
+      }
       break;
     case ARROW_UP:
-      E.cy--;
+      if (E.cy != 0) {
+        E.cy--;
+      }
       break;
     case ARROW_DOWN:
-      E.cy++;
+      if (E.cy != E.numrows) {
+      E.cy++; 
+      }
       break;
   }
 }
@@ -245,6 +347,24 @@ void editorProcessKeypress(void) {
       write(STDOUT_FILENO, "\x1b[2J", 4);
       write(STDOUT_FILENO, "\x1b[H", 3);
       exit(0);
+      break;
+
+    //PAGE_UP and PAGE_DOWN to the top and bottom of the screen, while HOME_KEY and END_KEY move cursor left and right edge of screen
+    case HOME_KEY:
+      E.cx = 0;
+      break;
+
+    case END_KEY:
+      E.cx = E.screencols - 1;
+      break;
+
+    case PAGE_UP:
+    case PAGE_DOWN:
+      {
+        int times = E.screenrows;
+        while (times--)
+          editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+      }
       break;
   //cursor movement
     case ARROW_UP:
@@ -262,12 +382,20 @@ void initEditor(void) {
   // initialize cursor position at 0,0 (top-left corner)
   E.cx = 0;
   E.cy = 0;
+  E.rowoff = 0; //scroll to the top of file by default
+  E.numrows = 0;
+  E.row = NULL;
+
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
   enableRawMode();
   initEditor();
+  //only call editoropen() when argc != 1, so it can compile and run blank program correctly
+  if (argc >= 2) {
+    editorOpen(argv[1]);
+  }
   //it read 1 byte from standard input the into variable c and compare to 1(which is 1 byte of char)
   while (1) {
     editorRefreshScreen();
@@ -276,4 +404,4 @@ int main(void) {
   return 0;
 }
 
-//currently on step 48. working on process
+//currently on step 69. working on process

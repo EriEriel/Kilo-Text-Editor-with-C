@@ -4,21 +4,21 @@
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 
-#include <ctype.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <termios.h>
-#include <unistd.h>
+#include <ctype.h> //ASCII string conversion and checking.
+#include <errno.h> //Define errno macro for reporting error conditions
+#include <stdio.h> //Standard I/O operation
+#include <stdlib.h>//dynamic memory management
+#include <string.h>//used to mamipulate string array and memory blocks
+#include <sys/ioctl.h>//system call to manipulate terminal and special file
+#include <sys/types.h>//provide system data type
+#include <termios.h>//provide std controlling, async communication port and terminal I/O
+#include <unistd.h>//not part of stdlib in C. Provide POSIX(Portable Operation System Interface) operation system API
 
 /*** defines ***/
 
 #define KILO_VERSION "0.0.1"
 
-//Set upper 3 bits of character(1 byte) to 0. mimic Ctrl press
+//Set upper 3 bits of character(1 byte) to 0. mimic Ctrl press on terminal level
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
@@ -39,26 +39,30 @@ enum editorKey {
 //erow stands for "editor row", it store line of text as pointer to dynamically re-allocate character abd data length
 typedef struct erow {
   int size;
+  int rsize;
   char *chars;
+  char *render;
 } erow;
 //store editor state in E
 struct editorConfig {
   int cx, cy; //cursor position
-  int rowoff; //row offset
+  int rowoff; //row offset for vertical scrolling
+  int coloff; //column offset for horizontal scrolling
   int screenrows;
   int screencols;
-  int numrows;
-  erow *row;
-  struct termios orig_termios;
+  int numrows; //amount of rows
+  erow *row; //size of row in bytes
+  struct termios orig_termios; //original terminal state
 };
 
 struct editorConfig E;
 
 /*** terminal ***/
 
+//print error message and exit program immediatly
 void die(const char *s) {
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  write(STDOUT_FILENO, "\x1b[2J", 4); //erase entire screen
+  write(STDOUT_FILENO, "\x1b[H", 3);  //move cursor to top-left corner
   //When C library function fail it will set global errno variable to indicate the error
   //perror() looks at the global errno and prints a descriptive error message for it.
   perror(s);
@@ -95,7 +99,7 @@ void enableRawMode(void) {
  int editorReadKey(void) {
   int nread;
   char c;
-  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) { //while read(keyboard input in to buffer &c each by 1 byte) != 1
     if (nread == -1 && errno != EAGAIN) die("read");
   }
 
@@ -181,6 +185,24 @@ int getWindowSize(int *rows, int *cols) {
 }
 
 /*** row operation ***/
+
+//free the old render buffer than allocate the new one, then copy each char to the render buffer
+void editorUpdateRow(erow *row) {
+  free(row->render);
+  row->render = malloc(row->size + 1);
+
+  int j;
+  int idx = 0;
+  for (j = 0; j < row->size; j++) {
+    row->render[idx++] = row->chars[j];
+  }
+  //null terminate the string so C know where string end
+  row->render[idx] = '\0';
+  //Update the rsize
+  row->rsize = idx;
+}
+
+
 //append the row and allocate space for the new row
 void editorAppendRow(char *s, size_t len) {
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
@@ -190,6 +212,11 @@ void editorAppendRow(char *s, size_t len) {
   E.row[at].chars = malloc(len + 1);
   memcpy(E.row[at].chars, s, len);
   E.row[at].chars[len] = '\0';
+
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
+  editorUpdateRow(&E.row[at]);
+
   E.numrows++;
 }
 
@@ -249,6 +276,12 @@ void editorScroll(void) {
   if (E.cy >= E.rowoff + E.screenrows) {
     E.rowoff = E.cy - E.screenrows + 1;
   }
+  if (E.cx < E.coloff) {
+    E.coloff = E.cx;
+  }
+  if (E.cx >= E.coloff + E.screencols) {
+    E.coloff = E.cx - E.screencols + 1;
+  }
 }
 
 // draw ~ in the begining of the line by the size of window
@@ -276,9 +309,10 @@ void editorDrawRows(struct abuf *ab) {
       // draw ~ at last line
       }
     } else {
-      int len = E.row[filerow].size;
+      int len = E.row[filerow].size - E.coloff;
+      if (len < 0) len = 0;
       if (len > E.screencols) len = E.screencols;
-      abAppend(ab, E.row[filerow].chars, len);
+      abAppend(ab, &E.row[filerow].chars[E.coloff], len);
     }
     //only clear one line at a time as it redrew them
     //K command(Erase in Line) O is defualt argument
@@ -302,7 +336,8 @@ void editorRefreshScreen(void) {
   
   char buf[32];
   //set cursor position
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, 
+                                            (E.cx - E.coloff) + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -315,15 +350,25 @@ void editorRefreshScreen(void) {
 /*** input ***/
 //cursor movement + out of bound prevention
 void editorMoveCursor(int key) {
+  erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
   switch (key)  {
     case ARROW_LEFT:
       if (E.cx != 0) {
         E.cx--;
+      } else if (E.cy > 0) {
+        E.cy--;
+        E.cx = E.row[E.cy].size; //if user press <- at the begining of line, move cursor to the end of previos line
       }
       break;
+
     case ARROW_RIGHT:
-      if (E.cx != E.screencols - 1) {
+      if (row && E.cx < row->size) { //limit cursor move to the end of line but not off the screen
         E.cx++;
+      } else if (row && E.cx == row->size) {
+        E.cy++;
+        E.cx = 0;  //if user press -> at the end of line, move cursor to the begining of next line
+
       }
       break;
     case ARROW_UP:
@@ -332,10 +377,17 @@ void editorMoveCursor(int key) {
       }
       break;
     case ARROW_DOWN:
-      if (E.cy != E.numrows) {
+      if (E.cy < E.numrows) { //let cursor move past buttom of the screen but not past the bottom of the file
       E.cy++; 
       }
       break;
+  }
+
+  //prevent out of bound row access, invalid column position, and cursor always stay on valid text 
+  row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+  int rowlen = row ? row->size : 0;
+  if (E.cx > rowlen) { //check if curosr x position out of text
+    E.cx = rowlen; //if so, set cursor x position to the end of text
   }
 }
 
@@ -383,6 +435,7 @@ void initEditor(void) {
   E.cx = 0;
   E.cy = 0;
   E.rowoff = 0; //scroll to the top of file by default
+  E.coloff = 0;
   E.numrows = 0;
   E.row = NULL;
 
@@ -404,4 +457,4 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-//currently on step 69. working on process
+//currently on step 81. working on process

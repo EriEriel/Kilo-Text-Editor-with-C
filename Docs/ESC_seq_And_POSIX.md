@@ -3,8 +3,10 @@
 \x1b -> ESC 
 [ -> sequences for next input
 
+- ESC[K = erase entire line
 - ESC[2J = erase entire screen
 - ESC[H = move cursor to the top-left corner
+- ESC[m = text formatting (bold(1), underscore(4), blink(5) , inverted colors(7)) can have multiple attributes like ESC[1;4;5;7m
 
 ## POSIX stream
 

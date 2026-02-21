@@ -70,6 +70,8 @@ struct editorConfig E;
 /*** prototypes ***/
 
 void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen(void);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 /*** terminal ***/
 
@@ -209,6 +211,19 @@ int editorRowCxtoRx(erow *row, int cx) {
     rx++;
   }
   return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx) {
+  int cur_rx = 0;
+  int cx;
+  for (cx = 0; cx < row->size; cx++) {
+    if (row->chars[cx] == '\t')
+     cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+    cur_rx++;
+
+    if (cur_rx > rx) return cx;
+  }
+  return cx;
 }
 
 //free the old render buffer than allocate the new one, then copy each char to the render buffer
@@ -390,7 +405,13 @@ void editorOpen(char *filename) {
 }
 
 void editorSave(void) {
-  if (E.filename == NULL) return;
+  if (E.filename == NULL) {
+    E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
+    if (E.filename == NULL) {
+      editorSetStatusMessage("Save aborted");
+      return;
+    }
+  }
 
   int len;
   char *buf = editorRowToString(&len);
@@ -413,8 +434,38 @@ void editorSave(void) {
   editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
 
+/*** find ***/
+
+//find the next matching word
+void editorFindCallback(char *query, int key) {
+  if (key == '\r' || key == '\x1b') {
+    return;
+  }
+
+  int i;
+  for (i = 0; i < E.numrows; i++) {
+    erow *row = &E.row[i];
+    char *match = strstr(row->render, query);
+    if (match) {
+      E.cy = i;
+      E.cx = editorRowRxToCx(row, match - row->render);
+      E.rowoff = E.numrows;
+      break;
+    }
+  }
+}
+
+void editorFind(void) {
+  char *query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+
+  if (query) {
+    free(query);
+  }
+}
+
+
+
 /*** append buffer ***/
-//previously,we redraw the line with many small write() but now we want to write() only once so first we built buffer
 //create dynamic string
 struct abuf {
   char *b;
@@ -566,6 +617,46 @@ void editorSetStatusMessage(const char *fmt, ...) {
 
 
 /*** input ***/
+
+//edit message in status bar
+char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
+  size_t bufsize = 128;
+  char *buf = malloc(bufsize);
+
+  size_t buflen = 0;
+  buf[0] = '\0';
+
+  while (1) {
+    editorSetStatusMessage(prompt, buf);
+    editorRefreshScreen();
+
+    int c = editorReadKey();
+    if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+      if (buflen != 0) buf[--buflen] = '\0';
+    } else if (c == '\x1b') {
+      editorSetStatusMessage("");
+      if (callback) callback(buf, c);
+      free(buf);
+      return NULL;
+    } else if (c == '\r') {
+      if (buflen != 0) {
+        editorSetStatusMessage("");
+      if (callback) callback(buf, c);
+        return buf;
+      }
+    } else if (!iscntrl(c) && c < 128) {
+      if (buflen == bufsize - 1) {
+        bufsize *= 2;
+        buf = realloc(buf, bufsize);
+      }
+      buf[buflen++] = c;
+      buf[buflen] = '\0';
+    }
+
+    if (callback) callback(buf, c);
+  }
+}
+
 //cursor movement + out of bound prevention
 void editorMoveCursor(int key) {
   erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
@@ -645,6 +736,10 @@ void editorProcessKeypress(void) {
         E.cx = E.row[E.cy].size;
       break;
 
+    case CTRL_KEY('f'):
+      editorFind();
+      break;
+
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
@@ -715,7 +810,8 @@ int main(int argc, char *argv[]) {
     editorOpen(argv[1]);
   }
  
-  editorSetStatusMessage("HELP: Ctrl-Q = quit | Ctrl-Q = quit");
+  editorSetStatusMessage(
+    "HELP: Ctrl-Q = quit | Ctrl-Q = quit | Ctrl-F = find");
 
   //it read 1 byte from standard input the into variable c and compare to 1(which is 1 byte of char)
   while (1) {
@@ -725,4 +821,4 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-//currently on step 125. working on process
+//currently on step 138. Lastest feature implement : Increment search .working on process

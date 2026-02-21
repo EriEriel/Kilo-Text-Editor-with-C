@@ -5,8 +5,21 @@
 
 - ESC[K = erase entire line
 - ESC[2J = erase entire screen
+- ESC[(nums)c = cursor forward by nums
+- ESC[(nums)b = cursor backward by nums
 - ESC[H = move cursor to the top-left corner
 - ESC[m = text formatting (bold(1), underscore(4), blink(5) , inverted colors(7)) can have multiple attributes like ESC[1;4;5;7m
+- ESC[(style)m = use to colors ASCII text (style) is for color number, after colors the text. We need to ESC[39m to reset back to default color.
+ Code	Color
+  30	Black
+  31	Red
+  32	Green
+  33	Yellow
+  34	Blue
+  35	Magenta
+  36	Cyan
+  37	White
+  39	Default
 
 ## POSIX stream
 

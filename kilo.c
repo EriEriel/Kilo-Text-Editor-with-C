@@ -39,6 +39,12 @@ enum editorKey {
   PAGE_DOWN
 };
 
+enum editorHighlight {
+  HL_NORMAL = 0,
+  HL_NUMBER,
+  HL_MATCH
+};
+
 /*** data ***/
 
 //erow stands for "editor row", it store line of text as pointer to dynamically re-allocate character abd data length
@@ -47,6 +53,7 @@ typedef struct erow {
   int rsize;
   char *chars;
   char *render;
+  unsigned char *hl;
 } erow;
 //store editor state in E
 struct editorConfig {
@@ -200,6 +207,51 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
+/*** syntax highlighting ***/
+
+int is_separator(int c) {
+  return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+}
+
+
+void editorUpdateSyntax(erow *row) {
+  row->hl = realloc(row->hl, row->rsize);
+
+  /*
+   * memset() - fill a block of memory with a specific constant byte value
+   * return a pointer to the memory area
+   * void *memset(void *s, int c, size_t n);
+   */
+  memset(row->hl, HL_NORMAL, row->rsize);
+
+  int prev_sep = 1;
+
+  int i = 0;
+  while (i < row->rsize) {
+    char c = row->render[i];
+    unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+    if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) ||
+       (c == '.' && prev_hl == HL_NUMBER)) {
+      row->hl[i] = HL_NUMBER;
+      i++;
+      prev_sep = 0;
+      continue;
+    }
+
+    prev_sep = is_separator(c);
+    i++;
+  }
+}
+
+int editorSyntaxToColor(int hl) {
+  switch (hl) {
+    case HL_NUMBER: return 31;
+    case HL_MATCH: return 34;
+    default: return 37;
+  }
+}
+
 /*** row operation ***/
 
 int editorRowCxtoRx(erow *row, int cx) {
@@ -250,6 +302,8 @@ void editorUpdateRow(erow *row) {
   row->render[idx] = '\0';
   //Update the rsize
   row->rsize = idx;
+
+  editorUpdateSyntax(row);
 }
 
 //to the new row
@@ -266,6 +320,7 @@ void editorInsetRow(int at, char *s, size_t len) {
 
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
+  E.row[at].hl = NULL;
   editorUpdateRow(&E.row[at]);
 
   E.numrows++;
@@ -276,6 +331,7 @@ void editorInsetRow(int at, char *s, size_t len) {
 void editorFreeRow(erow *row) {
   free(row->render);
   free(row->chars);
+  free(row->hl);
 }
 
 void editorDelRow(int at) {
@@ -436,34 +492,78 @@ void editorSave(void) {
 
 /*** find ***/
 
-//find the next matching word
+//find the next matching word. also set cursor position to their initial value if cancel the search
 void editorFindCallback(char *query, int key) {
-  if (key == '\r' || key == '\x1b') {
-    return;
+  static int last_match = -1;
+  static int direction = 1;
+
+  static int saved_hl_line;
+  static char *saved_hl = NULL;
+
+  //use to restore default text color after search
+  if (saved_hl) {
+    memcpy(E.row[saved_hl_line].hl, saved_hl, E.row[saved_hl_line].rsize);
+    free(saved_hl);
+    saved_hl = NULL;
   }
 
+  if (key == '\r' || key == '\x1b') {
+    last_match = -1;
+    direction = 1;
+    return;
+  } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+    direction = 1;
+  } else if (key == ARROW_LEFT || key == ARROW_UP) {
+    direction = -1;
+  } else {
+    last_match = -1;
+    direction = 1;
+  }
+
+  if (last_match == -1) direction = 1;
+  int current = last_match;
   int i;
   for (i = 0; i < E.numrows; i++) {
-    erow *row = &E.row[i];
+    current += direction;
+    if (current == -1) current = E.numrows - 1;
+    else if (current == E.numrows) current = 0;
+
+    erow *row = &E.row[current];
     char *match = strstr(row->render, query);
     if (match) {
-      E.cy = i;
+      last_match = current;
+      E.cy = current;
       E.cx = editorRowRxToCx(row, match - row->render);
       E.rowoff = E.numrows;
+
+      saved_hl_line = current;
+      saved_hl = malloc(row->rsize);
+      memcpy(saved_hl, row->hl, row->rsize);
+      memset(&row->hl[match - row->render], HL_MATCH, strlen(query));
       break;
     }
   }
 }
 
+//search funciotn, also restore cursor position when cancelling search
 void editorFind(void) {
-  char *query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+  int saved_cx = E.cx;
+  int saved_cy = E.cy;
+  int saved_coloff = E.coloff;
+  int saved_rowoff = E.rowoff;
+
+  char *query = editorPrompt("Search: %s (ESC/Arrows/Enter)", 
+                             editorFindCallback);
 
   if (query) {
     free(query);
+  } else {
+    E.cx = saved_cx;
+    E.cy = saved_cy;
+    E.coloff = saved_coloff;
+    E.rowoff = saved_rowoff;
   }
 }
-
-
 
 /*** append buffer ***/
 //create dynamic string
@@ -474,14 +574,46 @@ struct abuf {
 
 #define ABUF_INIT {NULL, 0}
 
-// append s to abuf and then use realloc() to re-allocate memory to hold new string
+// this is one of core function of Kilo. instead of write() every screenrefresh,
+// we create big buffer and and write() only once.
+// append s to abuf and then use realloc() to re-allocate memory to hold new string.
 void abAppend(struct abuf *ab, const char *s, int len) {
+  /*
+   * Grow (or create) the buffer so it can hold:
+   *   - existing data (ab->len)
+   *   - new data we want to append (len)
+   *
+   * realloc():
+   *   - works like malloc() if ab->b == NULL
+   *   - preserves old data
+   */
   char *new = realloc(ab->b, ab->len + len);
 
+  /*
+   * If memory allocation failed, do nothing.
+   * Kilo chooses to fail silently instead of crashing.
+   */
   if (new == NULL) return;
+ 
   //copy the string s ,and update the pointer and length to abuf new values
+  /*
+   * Copy the new bytes into the buffer
+   * starting exactly at the end of existing data.
+   *
+   * new_buf + ab->len
+   * └── append position
+   */
   memcpy(&new[ab->len], s, len);
+
+  /*
+   * Update the buffer pointer.
+   * (realloc may move memory to a new location)
+   */
   ab->b = new;
+
+  /*
+   * Update length to include the newly appended data.
+   */
   ab->len += len;
 }
 // deallocates the dynamic memory used by an abuf
@@ -540,14 +672,35 @@ void editorDrawRows(struct abuf *ab) {
       int len = E.row[filerow].rsize - E.coloff;
       if (len < 0) len = 0;
       if (len > E.screencols) len = E.screencols;
-      abAppend(ab, &E.row[filerow].render[E.coloff], len);
+      char *c = &E.row[filerow].render[E.coloff];
+      unsigned char *hl = &E.row[filerow].hl[E.coloff];
+      int current_color = -1;
+      int j;
+      for (j = 0; j < len; j++) {
+        if (hl[j] == HL_NORMAL) {
+          if (current_color != -1) {
+          abAppend(ab, "\x1b[39m", 5);
+          current_color = -1;
+          }
+          abAppend(ab, &c[j], 1);
+        } else {
+          int color = editorSyntaxToColor(hl[j]);
+          if (color != current_color) {
+            current_color = color;
+            char buf[16];
+            int clean = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+            abAppend(ab, buf, clean);
+          }
+          abAppend(ab, &c[j], 1);
+        }
+      }
+      abAppend(ab, "\x1b[39m", 5);
     }
     //only clear one line at a time as it redrew them
     //K command(Erase in Line) O is defualt argument
     abAppend(ab, "\x1b[K", 3);
     abAppend(ab, "\r\n", 2);
-    }
-  
+  }
 }
 
 void editorDrawStatusBar(struct abuf *ab) {
@@ -821,4 +974,4 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-//currently on step 138. Lastest feature implement : Increment search .working on process
+//currently on step 157. Lastest feature implement : syntax highlight .working on detect filetype
